@@ -1,68 +1,75 @@
 /**
- * main.ts — make.fun "markdown-render-speed-02" submission driver.
+ * main.ts — driver for the make.fun "markdown-render-speed-02" bounty.
  *
- * Contract
- * --------
- * The grading harness runs `node main.ts` inside a fresh container with two
- * mounted directories:
+ * Contract (the grading harness runs `node main.ts` in a container)
+ * ---------------------------------------------------------------
+ *   - Reads /input/cases.json (a JSON array of { id, markdown } objects).
+ *   - Renders every `markdown` field via `parse()` from ./parse.js (a
+ *     byte-exact fork of marked 18.1.3 with default options, GFM on).
+ *   - Writes /output/html.json (a JSON array of HTML strings) preserving the
+ *     exact input order — one entry per case, same index.
+ *   - Exits non-zero, WITHOUT writing any output, on any error.
  *
- *   /input/cases.json   input: JSON array of { id, markdown } (720 cases)
- *   /output/html.json    our output: JSON array of HTML strings, one per
- *                        case, in exactly the same order as the input.
+ * Outside the container the same layout is exposed via the environment
+ * variables MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR, so a local test run and
+ * a container run behave identically. Resolution order: env var, else the
+ * fixed '/input' and '/output' container mounts.
  *
- * Outside the container the same layout is exposed through the environment
- * variables MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR, so a container run and a
- * local test run behave identically. Fallback order: env var ?? '/input' /
- * '/output'.
- *
- * Design
- * ------
- * - All markdown logic lives in ./parse.js (a marked v18.1.3 fork tuned for
- *   this contest). This file only performs I/O, shape validation and
- *   bookkeeping — it contains no markdown logic of its own.
- * - The result array is preallocated and filled strictly in input order;
- *   parse() keeps no state between calls, so every case renders
- *   independently and deterministically.
- * - Output is written as one compact JSON array (no pretty-printing) in a
- *   single writeFileSync, so the grader never observes a partial file.
- * - On any error we exit non-zero WITHOUT writing the output file, and
- *   print the reason to stderr — a crash is unranked, so fail loudly
- *   rather than leave a malformed artifact behind.
+ * Design notes
+ * ------------
+ *   - All markdown logic lives in ./parse.js. This file is pure I/O and
+ *     bookkeeping — it contains no markdown knowledge of its own.
+ *   - The output array is preallocated and filled strictly in input order,
+ *     so case i always lands in slot i even if a later case throws.
+ *   - Output is produced as a single compact JSON string (no pretty
+ *     printing) and written with one writeFileSync, so the grader never
+ *     observes a partial or half-written file.
+ *   - Rendering is single-threaded and deterministic; the process keeps no
+ *     state between cases, so repeated runs produce identical output.
+ *   - On failure we log the reason to stderr and leave any pre-existing
+ *     output file untouched (a crash is unranked — better to fail loudly
+ *     than leave a malformed artifact).
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
-/** One contest case as it arrives in cases.json. */
-type Case = { id: string; markdown: string };
+/** One contest case as it appears in cases.json. */
+interface Case {
+  id: string;
+  markdown: string;
+}
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const INPUT_FILE = join(INPUT_DIR, 'cases.json');
-const OUTPUT_FILE = join(OUTPUT_DIR, 'html.json');
+const INPUT_PATH = join(INPUT_DIR, 'cases.json');
+const OUTPUT_PATH = join(OUTPUT_DIR, 'html.json');
 
 /**
- * Read and shape-check the input.
- * We validate the array up front so malformed data fails loudly, before any
- * rendering effort is spent.
+ * Read and validate the input file.
+ *
+ * We parse the JSON up front and shape-check every element so malformed
+ * input fails loudly before we spend any render effort. The marker shape is
+ * `{ id, markdown }`; only `markdown` is actually consumed, but the check
+ * keeps contract violations visible early.
  */
 function loadCases(): Case[] {
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(INPUT_FILE, 'utf8'));
+    raw = JSON.parse(readFileSync(INPUT_PATH, 'utf8'));
   } catch (err) {
-    throw new Error(`cannot read ${INPUT_FILE}: ${String(err)}`);
+    throw new Error(`cannot read ${INPUT_PATH}: ${String(err)}`);
   }
 
   if (!Array.isArray(raw)) {
-    throw new Error(`expected a JSON array at top level in ${INPUT_FILE}`);
+    throw new Error(`expected a JSON array at the top level of ${INPUT_PATH}`);
   }
 
   for (let i = 0; i < raw.length; i++) {
-    const c = raw[i] as { markdown?: unknown } | null;
-    if (typeof c !== 'object' || c === null || typeof c.markdown !== 'string') {
-      throw new Error(`case ${i} is malformed (markdown must be a string)`);
+    const item = raw[i] as { markdown?: unknown } | null;
+    if (item === null || typeof item !== 'object' || typeof item.markdown !== 'string') {
+      throw new Error(`case ${i} is malformed: markdown must be a string`);
     }
   }
 
@@ -70,9 +77,11 @@ function loadCases(): Case[] {
 }
 
 /**
- * Render every case in input order; returns the parallel array of HTML
- * strings. Preallocation guarantees case i always lands at slot i even if
- * a later case throws.
+ * Render every case in input order into a preallocated array.
+ *
+ * Preallocation guarantees a deterministic slot for each case and avoids the
+ * array growing during the hot loop. `parse` is pure w.r.t. its input, so no
+ * state leaks between cases.
  */
 function renderAll(cases: Case[]): string[] {
   const html = new Array<string>(cases.length);
@@ -82,17 +91,23 @@ function renderAll(cases: Case[]): string[] {
   return html;
 }
 
-/** Write the final artifact as compact JSON (no extra whitespace). */
+/**
+ * Serialize and write the output file.
+ *
+ * JSON.stringify of a plain array emits compact JSON (no whitespace), which
+ * keeps the artifact small and byte-stable. A single synchronous write means
+ * the file appears all at once.
+ */
 function writeOutput(html: string[]): void {
-  writeFileSync(OUTPUT_FILE, JSON.stringify(html));
+  writeFileSync(OUTPUT_PATH, JSON.stringify(html));
 }
 
-/** Wire everything together and report what was done. */
+/** The full pipeline: load -> render -> write, then report. */
 function main(): void {
   const cases = loadCases();
   const html = renderAll(cases);
   writeOutput(html);
-  console.log(`rendered ${cases.length} cases -> ${OUTPUT_FILE}`);
+  console.log(`rendered ${cases.length} cases -> ${OUTPUT_PATH}`);
 }
 
 try {
