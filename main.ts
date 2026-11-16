@@ -1,28 +1,33 @@
 /**
- * main.ts — make.fun "markdown-render-speed-02" entry driver.
+ * main.ts — make.fun "markdown-render-speed-02" submission driver.
  *
- * The grading harness launches `node main.ts` inside a fresh container with
- * two mounted directories:
+ * Contract
+ * --------
+ * The grading harness runs `node main.ts` inside a fresh container with two
+ * mounted directories:
  *
  *   /input/cases.json   input: JSON array of { id, markdown } (720 cases)
  *   /output/html.json    our output: JSON array of HTML strings, one per
- *                        case, in exactly the same order as the input
+ *                        case, in exactly the same order as the input.
  *
- * Outside the container the same contract is available through the
- * MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR environment variables. When they
- * are unset we fall back to /input and /output, so a container run and a
- * local test run behave identically.
+ * Outside the container the same layout is exposed through the environment
+ * variables MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR, so a container run and a
+ * local test run behave identically. Fallback order: env var ?? '/input' /
+ * '/output'.
  *
- * Design notes:
- *   - All rendering is delegated to parse.js, a self-contained fork of the
- *     marked v18.1.3 engine. This file only performs I/O and bookkeeping —
- *     it deliberately contains no markdown logic of its own.
- *   - The result array is preallocated and filled in strict input order.
- *     parse() keeps no state between calls, so every case renders
- *     independently and deterministically.
- *   - Output is written atomically (single writeFileSync at the end). If
- *     anything goes wrong we exit non-zero without touching the output
- *     file, rather than writing a partial or malformed artifact.
+ * Design
+ * ------
+ * - All markdown logic lives in ./parse.js (a marked v18.1.3 fork tuned for
+ *   this contest). This file only performs I/O, shape validation and
+ *   bookkeeping — it contains no markdown logic of its own.
+ * - The result array is preallocated and filled strictly in input order;
+ *   parse() keeps no state between calls, so every case renders
+ *   independently and deterministically.
+ * - Output is written as one compact JSON array (no pretty-printing) in a
+ *   single writeFileSync, so the grader never observes a partial file.
+ * - On any error we exit non-zero WITHOUT writing the output file, and
+ *   print the reason to stderr — a crash is unranked, so fail loudly
+ *   rather than leave a malformed artifact behind.
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -34,14 +39,13 @@ type Case = { id: string; markdown: string };
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
 const INPUT_FILE = join(INPUT_DIR, 'cases.json');
 const OUTPUT_FILE = join(OUTPUT_DIR, 'html.json');
 
 /**
- * Read and validate the contest input.
- * We check the array shape up front so a malformed input fails loudly and
- * early, before any rendering work is spent.
+ * Read and shape-check the input.
+ * We validate the array up front so malformed data fails loudly, before any
+ * rendering effort is spent.
  */
 function loadCases(): Case[] {
   let raw: unknown;
@@ -65,7 +69,11 @@ function loadCases(): Case[] {
   return raw as Case[];
 }
 
-/** Render every case in order; returns the parallel array of HTML strings. */
+/**
+ * Render every case in input order; returns the parallel array of HTML
+ * strings. Preallocation guarantees case i always lands at slot i even if
+ * a later case throws.
+ */
 function renderAll(cases: Case[]): string[] {
   const html = new Array<string>(cases.length);
   for (let i = 0; i < cases.length; i++) {
@@ -90,7 +98,6 @@ function main(): void {
 try {
   main();
 } catch (err) {
-  // A crash is unranked; fail loudly rather than leave a partial file.
   console.error(err);
   process.exitCode = 1;
 }
